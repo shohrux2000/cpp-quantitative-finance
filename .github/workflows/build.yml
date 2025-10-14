@@ -1,0 +1,42 @@
+name: Build Windows exe
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 (MinGW) 
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+
+      - name: Install mingw-w64 gcc
+        shell: bash
+        run: |
+          pacman -S --noconfirm mingw-w64-x86_64-gcc
+
+      - name: Compile all exercises
+        shell: bash
+        run: |
+          if [ -f "exercise01.cpp" ]; then g++ -static -O2 exercise01.cpp -o exercise01.exe; fi
+          if [ -f "exercise02.cpp" ]; then g++ -static -O2 exercise02.cpp -o exercise02.exe; fi
+          if [ -f "exercise03.cpp" ]; then g++ -static -O2 exercise03.cpp -o exercise03.exe; fi
+          if [ -f "exercise04.cpp" ]; then g++ -static -O2 exercise04.cpp -o exercise04.exe; fi
+
+      - name: Upload exe artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-exes
+          path: |
+            exercise01.exe
+            exercise02.exe
+            exercise03.exe
+            exercise04.exe
