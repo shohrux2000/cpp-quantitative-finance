@@ -13,29 +13,23 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up MinGW
-        uses: egor-tensin/setup-mingw@v2
+      - name: Install MSYS2 and MinGW
+        uses: msys2/setup-msys2@v2
         with:
-          platform: x64
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-gcc
 
-      - name: Compile exercise01
-        run: g++ -o exercise01.exe exercise01.cpp
+      - name: Compile all exercises
+        shell: msys2 {0}
+        run: |
+          for file in $(ls *.cpp); do
+            echo "Compiling $file..."
+            g++ "$file" -o "${file%.cpp}.exe"
+          done
 
-      - name: Compile exercise02
-        run: g++ -o exercise02.exe exercise02.cpp
-
-      - name: Compile exercise03
-        run: g++ -o exercise03.exe exercise03.cpp
-
-      - name: Compile exercise04
-        run: g++ -o exercise04.exe exercise04.cpp
-
-      - name: Upload compiled executables
+      - name: Upload executables
         uses: actions/upload-artifact@v4
         with:
-          name: compiled-exes
-          path: |
-            exercise01.exe
-            exercise02.exe
-            exercise03.exe
-            exercise04.exe
+          name: compiled-exe
+          path: ./*.exe
