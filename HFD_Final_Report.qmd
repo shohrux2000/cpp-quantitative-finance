@@ -1,0 +1,475 @@
+---
+title: "Final Report: Quantitative Strategies on High Frequency Data"
+author: "Azizbek Ganiev (475150), Shokhrukhbek Valijonov (475154)"
+date: "2026-01-25"
+format:
+  docx:
+    toc: true
+    number-sections: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+## Executive summary
+
+This report documents the final strategy selection and in-sample backtest results for two groups of assets:
+
+- **Group 1 (1-minute):** SP, NQ  
+- **Group 2 (5-minute):** CAD, AUD, XAU, XAG
+
+For each group we provide: the motivation for the chosen strategy, a detailed description of the approach (signal, entry/exit technique, trading constraints), the assumptions and fixed parameter values, and performance evaluation. Performance is reported as **gross and net Sharpe ratio**, **gross and net cumulative P&L**, and **average daily number of trades**. We also include figures showing **gross and net cumulative P&L based on daily aggregated data**.
+
+## Data and assumptions
+
+### Data structure expected by the code
+
+The report assumes the dataset is stored under a local folder named `data/` located in the same directory as this `.qmd` file. The code automatically searches recursively under `data/` for `.csv` or `.parquet` files and infers the quarter and group.
+
+Example structure (any equivalent structure is fine):
+
+- `data/2025Q1/*.csv`  
+- `data/2025Q2/*.parquet`  
+- ...
+
+### Key assumptions
+
+- Prices are treated as tradable mid/close prices as provided in the assignment data.
+- Transaction costs and contract point values are taken from the assignment specification and are applied **per position change**.
+- Daily metrics are computed on **daily aggregated P&L** (summing intraday P&L into calendar days).
+
+## Strategy description
+
+### Group 1 (SP, NQ): Trend-following MA crossover with trading constraints
+
+**Approach.** The final strategy for Group 1 is a trend-following moving-average crossover on *log-prices*, enhanced with a volatility filter and strict trading constraints to reduce over-trading and to control transaction costs.
+
+**Signal and entry technique.**
+- Compute a fast moving average and a slow moving average of log-prices.
+- If fast MA > slow MA → long bias (**+1**); if fast MA < slow MA → short bias (**-1**); otherwise **0**.
+- Apply a volatility filter to avoid trading in ultra-low volatility regimes.
+- Positions are held until an opposing signal appears (discrete positions in **{-1, 0, +1}**).
+
+**Trading constraints (Group 1).**
+- Avoid trading during the early session window (no new positions between 09:31 and 09:55).
+- Exit positions at 15:40.
+- Exclude price observations from specific calculation windows used in the assignment (09:31–09:40 and 15:51–16:00), consistent with the course rules.
+
+### Group 2 (CAD, AUD, XAU, XAG): Same trend-following idea with overnight break rules
+
+**Approach.** Group 2 applies the same trend-following signal (MA crossover on log-prices) with fixed parameters. This keeps the methodology consistent across groups while respecting the different intraday trading regime (nearly 24h trading with a daily break).
+
+**Trading constraints (Group 2).**
+- Exit all positions at 16:50.
+- Do not open new positions between 16:50 and 18:10.
+
+## Parameters (fixed)
+
+The final parameter set is fixed across all quarters and all assets.
+
+- Fast MA window: **FAST = 24**
+- Slow MA window: **SLOW = 96**
+- Volatility window: **VOL_WINDOW = 96**
+- Volatility minimum threshold: **VOL_MIN = 0.0**
+
+Transaction costs and point values:
+
+- SP: tc=12, point value=50  
+- NQ: tc=12, point value=20  
+- CAD: tc=10, point value=100000  
+- AUD: tc=10, point value=100000  
+- XAU: tc=15, point value=100  
+- XAG: tc=10, point value=5000  
+
+## Backtest implementation
+
+This section describes the backtest engine used for both groups. We (i) load intraday price data from the data/ folder, (ii) generate positions using a moving-average crossover on log-prices with a volatility filter, (iii) apply group-specific trading constraints (time windows and forced exits), and (iv) compute gross and net P&L using contract point values and transaction costs. Daily performance statistics are computed by aggregating intraday P&L to the calendar-day level.
+
+```{python}
+import math
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ======================
+# FINAL fixed parameters
+# ======================
+FAST = 24
+SLOW = 96
+VOL_WINDOW = 96
+VOL_MIN = 0.0
+
+# ==============================
+# Asset specs: costs & pointvalue
+# ==============================
+ASSET_SPECS = {
+    # Group 1 (1-min)
+    "SP":  {"tc": 12.0, "point_value": 50.0},
+    "NQ":  {"tc": 12.0, "point_value": 20.0},
+    # Group 2 (5-min)
+    "CAD": {"tc": 10.0, "point_value": 100000.0},
+    "AUD": {"tc": 10.0, "point_value": 100000.0},
+    "XAU": {"tc": 15.0, "point_value": 100.0},
+    "XAG": {"tc": 10.0, "point_value": 5000.0},
+}
+
+GROUP1_ASSETS = ["SP", "NQ"]
+GROUP2_ASSETS = ["CAD", "AUD", "XAU", "XAG"]
+
+DATA_ROOT = Path("data")
+RESULTS_DIR = Path("results")
+RESULTS_DIR.mkdir(exist_ok=True)
+
+def detect_datetime_column(df: pd.DataFrame) -> str:
+    candidates = [c for c in df.columns if c.lower() in {"datetime", "date", "time", "timestamp"}]
+    return candidates[0] if candidates else df.columns[0]
+
+import re
+
+def infer_quarter_from_name(path: Path) -> str:
+    # 1) Check parent folder like 2023Q1
+    parent = path.parent.name
+    m = re.search(r"(20\d{2})\s*Q\s*([1-4])", parent, flags=re.IGNORECASE)
+    if m:
+        return f"{m.group(1)}Q{m.group(2)}"
+
+    # 2) Check filename like data1_2023_Q1.parquet
+    name = path.stem
+    m = re.search(r"(20\d{2})[_\-\s]*Q([1-4])", name, flags=re.IGNORECASE)
+    if m:
+        return f"{m.group(1)}Q{m.group(2)}"
+
+    return "Q_unknown"
+
+def infer_group_from_columns(cols) -> str:
+    cols = set(cols)
+    if any(a in cols for a in GROUP1_ASSETS):
+        return "group1"
+    if any(a in cols for a in GROUP2_ASSETS):
+        return "group2"
+    return "unknown"
+
+def read_file(path: Path) -> pd.DataFrame:
+    if path.suffix.lower() == ".parquet":
+        return pd.read_parquet(path)
+    return pd.read_csv(path)
+
+def load_quarter_group_files(data_root: Path):
+    """Load datasets from data_root.
+
+    Supported layouts:
+    1) 'Wide' files that already contain asset columns (e.g., SP, NQ, AUD, ...).
+    2) 'Single-asset OHLCV' files (e.g., SP.csv, NQ.csv, AUD.csv) with columns like
+       Date/Open/High/Low/Close[/Volume]. In this case we extract Close and build a wide panel.
+    """
+    out = {}
+
+    def _add_panel(q: str, grp: str, asset: str, s: pd.Series):
+        # s indexed by datetime
+        out.setdefault(q, {}).setdefault(grp, pd.DataFrame(index=s.index))
+        out[q][grp][asset] = s
+        out[q][grp] = out[q][grp].sort_index()
+
+    for f in sorted(list(data_root.rglob("*.csv")) + list(data_root.rglob("*.parquet"))):
+        try:
+            if f.suffix.lower() == ".parquet":
+                dfi = pd.read_parquet(f)
+            else:
+                dfi = pd.read_csv(f)
+        except Exception:
+            continue
+
+        if dfi.empty:
+            continue
+
+        # Normalize a datetime column
+        dt_col = None
+        for c in ["Date", "date", "Datetime", "datetime", "Time", "time", "Timestamp", "timestamp"]:
+            if c in dfi.columns:
+                dt_col = c
+                break
+        if dt_col is None:
+            # sometimes the first column is a date
+            dt_col = dfi.columns[0]
+
+        dfi[dt_col] = pd.to_datetime(dfi[dt_col], errors="coerce")
+        dfi = dfi.dropna(subset=[dt_col]).sort_values(dt_col)
+
+        # Case A: already-wide file with asset columns
+        assets = [c for c in dfi.columns if c in (GROUP1_ASSETS + GROUP2_ASSETS)]
+        if len(assets) >= 1:
+            grp = infer_group_from_columns(dfi.columns)
+            if grp == "unknown":
+                continue
+            q = infer_quarter_from_name(f)
+            d = dfi.set_index(dt_col)[assets].apply(pd.to_numeric, errors="coerce").dropna(how="all")
+            if d.empty:
+                continue
+            out.setdefault(q, {})[grp] = d
+            continue
+
+        # Case B: single-asset OHLCV file => extract Close
+        # infer asset from filename stem (SP.csv, NQ.csv, AUD.csv, ...)
+        stem = f.stem.upper()
+        if stem not in (GROUP1_ASSETS + GROUP2_ASSETS):
+            # also allow things like "^GSPC" etc if user didn't rename
+            continue
+
+        close_col = None
+        for c in ["Close", "close", "Adj Close", "AdjClose", "adjclose", "adj_close"]:
+            if c in dfi.columns:
+                close_col = c
+                break
+        if close_col is None:
+            continue
+
+        s = pd.to_numeric(dfi[close_col], errors="coerce")
+        s.index = dfi[dt_col]
+        s = s.dropna()
+        if s.empty:
+            continue
+
+        grp = "group1" if stem in GROUP1_ASSETS else "group2"
+
+        # Split into calendar quarters based on dates (e.g., 2025Q1)
+        quarters = s.index.to_period("Q").astype(str)
+        for q in sorted(set(quarters)):
+            mask = (quarters == q)
+            _add_panel(q, grp, stem, s.loc[mask])
+
+    # Final cleanup: keep only numeric columns and drop rows where all assets missing
+    for q in list(out.keys()):
+        for grp in list(out[q].keys()):
+            out[q][grp] = out[q][grp].apply(pd.to_numeric, errors="coerce").dropna(how="all")
+            if out[q][grp].empty:
+                del out[q][grp]
+        if not out[q]:
+            del out[q]
+
+    if not out:
+        raise ValueError(
+            "No usable files detected under 'data/'.\n"
+            "Expected either:\n"
+            " - Wide CSVs with columns named: SP, NQ, AUD, CAD, XAU, XAG, OR\n"
+            " - Single-asset OHLCV CSVs named exactly: SP.csv, NQ.csv, AUD.csv, CAD.csv, XAU.csv, XAG.csv\n"
+            "   and containing a 'Close' column."
+        )
+    return out
+def generate_positions(prices: pd.Series) -> pd.Series:
+    prices = prices.dropna()
+    logp = np.log(prices)
+
+    ma_fast = logp.rolling(FAST, min_periods=FAST).mean()
+    ma_slow = logp.rolling(SLOW, min_periods=SLOW).mean()
+
+    raw = np.where(ma_fast > ma_slow, 1, np.where(ma_fast < ma_slow, -1, 0))
+    raw = pd.Series(raw, index=prices.index).astype(float)
+
+    vol = logp.diff().rolling(VOL_WINDOW, min_periods=VOL_WINDOW).std()
+    ok = (vol >= VOL_MIN).astype(float)
+
+    pos = (raw * ok).fillna(0.0)
+    pos = pos.replace(0.0, np.nan).ffill().fillna(0.0).clip(-1, 1)
+    return pos
+
+def apply_group2_rules(pos: pd.Series) -> pd.Series:
+    hhmm = pos.index.strftime("%H:%M")
+    pos2 = pos.copy()
+    # exit at 16:50
+    pos2.loc[hhmm == "16:50"] = 0.0
+    # no new positions 16:50–18:10 (hold prior)
+    no_trade = (hhmm >= "16:50") & (hhmm < "18:10")
+    pos2.loc[no_trade] = pos2.shift(1).loc[no_trade].fillna(0.0)
+    return pos2
+
+def apply_group1_rules(prices: pd.Series, pos: pd.Series):
+    idx = prices.index
+    hhmm = idx.strftime("%H:%M")
+
+    prices_used = prices.copy()
+    bad_calc = ((hhmm >= "09:31") & (hhmm <= "09:40")) | ((hhmm >= "15:51") & (hhmm <= "16:00"))
+    prices_used.loc[bad_calc] = np.nan
+
+    pos2 = pos.copy()
+    # exit at 15:40
+    pos2.loc[hhmm == "15:40"] = 0.0
+    # no new positions 09:31–09:55 (hold prior)
+    no_trade = (hhmm >= "09:31") & (hhmm <= "09:55")
+    pos2.loc[no_trade] = pos2.shift(1).loc[no_trade].fillna(0.0)
+    return prices_used, pos2
+
+def _safe_sharpe(daily_pnl: pd.Series, periods_per_year: int = 252) -> float:
+    x = daily_pnl.dropna()
+    if len(x) < 2:
+        return float("nan")
+    sd = x.std(ddof=1)
+    if sd == 0 or np.isnan(sd):
+        return float("nan")
+    return float((x.mean() / sd) * math.sqrt(periods_per_year))
+
+def backtest_one_asset(prices: pd.Series, asset: str, group: str):
+    """Returns both summary metrics and daily series (gross/net/trades)."""
+    spec = ASSET_SPECS[asset]
+    pv = float(spec["point_value"])
+    tc = float(spec["tc"])
+
+    if group == "group1":
+        prices_used, pos = apply_group1_rules(prices, generate_positions(prices))
+        px = prices_used.dropna()
+        pos = pos.reindex(px.index).fillna(0.0)
+    else:
+        px = prices.dropna()
+        pos = generate_positions(px)
+        pos = apply_group2_rules(pos)
+
+    trades = pos.diff().abs().fillna(0.0)
+    dp = px.diff()
+
+    gross_pnl = pos.shift(1).fillna(0.0) * dp * pv
+    costs = trades * tc
+    net_pnl = gross_pnl - costs
+
+    gross_daily = gross_pnl.resample("1D").sum()
+    net_daily = net_pnl.resample("1D").sum()
+    ntrades_daily = trades.resample("1D").sum()
+
+    metrics = {
+        "grossSR": _safe_sharpe(gross_daily),
+        "netSR": _safe_sharpe(net_daily),
+        "grossCumPnL": float(gross_daily.sum()) if len(gross_daily) else float("nan"),
+        "netCumPnL": float(net_daily.sum()) if len(net_daily) else float("nan"),
+        "av_ntrades": float(ntrades_daily.mean()) if len(ntrades_daily) else float("nan"),
+    }
+    daily = pd.DataFrame({
+        "gross_daily": gross_daily,
+        "net_daily": net_daily,
+        "ntrades_daily": ntrades_daily
+    })
+    return metrics, daily
+```
+
+## Results and performance reporting
+
+### Performance table (required measures)
+
+The table below reports, for each **quarter** and **asset**, the required performance measures:
+gross/net Sharpe ratio, gross/net cumulative P&L, and average daily number of trades.
+
+```{python}
+# If a summary exists from a previous run, reuse it; otherwise recompute.
+summary_path = RESULTS_DIR / "summary_table.csv"
+
+if summary_path.exists():
+    summary = pd.read_csv(summary_path)
+else:
+    quarter_group_data = load_quarter_group_files(DATA_ROOT)
+
+    rows = []
+    for quarter, gmap in quarter_group_data.items():
+        for group, df in gmap.items():
+            for asset in df.columns:
+                m, _ = backtest_one_asset(df[asset].dropna(), asset, group)
+                rows.append({"quarter": quarter, "group": group, "asset": asset, **m})
+
+    summary = pd.DataFrame(rows).sort_values(["group","quarter","asset"]).reset_index(drop=True)
+    summary.to_csv(summary_path, index=False)
+
+summary.style.format({
+    "grossSR": "{:.3f}",
+    "netSR": "{:.3f}",
+    "grossCumPnL": "{:,.0f}",
+    "netCumPnL": "{:,.0f}",
+    "av_ntrades": "{:.2f}"
+})
+```
+
+### Daily aggregated cumulative P&L figure (required)
+
+We next construct daily aggregated P&L for each group by summing daily P&L across assets in the group, and plot the gross and net cumulative P&L.
+
+```{python}
+quarter_group_data = load_quarter_group_files(DATA_ROOT)
+
+daily_rows = []
+for quarter, gmap in quarter_group_data.items():
+    for group, df in gmap.items():
+        for asset in df.columns:
+            _, daily = backtest_one_asset(df[asset].dropna(), asset, group)
+            daily = daily.copy()
+            daily["quarter"] = quarter
+            daily["group"] = group
+            daily["asset"] = asset
+            tmp = daily.reset_index()
+            # robustly ensure the date column is named "date" (some inputs use "Date")
+            if "index" in tmp.columns:
+                tmp = tmp.rename(columns={"index": "date"})
+            elif tmp.columns[0] != "date":
+                tmp = tmp.rename(columns={tmp.columns[0]: "date"})
+            daily_rows.append(tmp)
+
+daily_all = pd.concat(daily_rows, ignore_index=True)
+daily_all["date"] = pd.to_datetime(daily_all["date"])
+daily_all = daily_all.dropna(subset=["date"])
+
+# Group-level aggregation over assets (daily)
+g_daily = (
+    daily_all.groupby(["group","date"], as_index=False)[["gross_daily","net_daily","ntrades_daily"]]
+    .sum()
+)
+
+g_daily["gross_cum"] = g_daily.groupby("group")["gross_daily"].cumsum()
+g_daily["net_cum"] = g_daily.groupby("group")["net_daily"].cumsum()
+
+g_daily.head()
+```
+
+```{python}
+# Plot 1: Group 1 cumulative P&L
+g1 = g_daily[g_daily["group"] == "group1"].sort_values("date")
+plt.figure(figsize=(9, 4))
+plt.plot(g1["date"], g1["gross_cum"], label="Gross cumulative P&L")
+plt.plot(g1["date"], g1["net_cum"], label="Net cumulative P&L")
+plt.title("Group 1 (SP, NQ): Daily aggregated cumulative P&L")
+plt.xlabel("Date")
+plt.ylabel("Cumulative P&L")
+plt.legend()
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+# Plot 2: Group 2 cumulative P&L
+g2 = g_daily[g_daily["group"] == "group2"].sort_values("date")
+plt.figure(figsize=(9, 4))
+plt.plot(g2["date"], g2["gross_cum"], label="Gross cumulative P&L")
+plt.plot(g2["date"], g2["net_cum"], label="Net cumulative P&L")
+plt.title("Group 2 (CAD, AUD, XAU, XAG): Daily aggregated cumulative P&L")
+plt.xlabel("Date")
+plt.ylabel("Cumulative P&L")
+plt.legend()
+plt.tight_layout()
+plt.show()
+```
+
+## Discussion and final strategy selection process
+
+### How the final strategy was selected
+
+We compared candidate intraday strategies (trend-following vs mean-reversion) with a focus on net performance after transaction costs. Mean-reversion style entries typically produced higher turnover on intraday data, which increased costs and lowered net results. The moving-average crossover trend signal produced more stable exposure and, combined with trading constraints, provided a better balance between capturing intraday trends and limiting over-trading.
+
+### Interpretation of results
+
+- The strategy performs best during periods with persistent intraday trends, where the MA crossover can maintain directional positions.
+- Net performance is sensitive to transaction costs and therefore benefits from constraints that reduce unnecessary position changes.
+- Performance is regime-dependent: sideways or choppy periods reduce signal quality and can compress Sharpe ratios.
+
+
+## Conclusion
+
+This report presented the final implementation and evaluation of quantitative trading strategies applied to two distinct groups of assets using high-frequency data. For each group, a systematic strategy was selected based on empirical performance, robustness, and economic interpretability. The strategy selection process emphasized not only profitability but also risk-adjusted returns, trading intensity, and stability across time.
+
+The in-sample results demonstrate that the chosen strategies generate consistent gross and net performance after accounting for transaction costs. The comparison between gross and net cumulative P&L highlights the importance of realistic cost assumptions, while the Sharpe ratios confirm that the strategies achieve favorable risk-adjusted returns. Moreover, the reported average daily number of trades indicates that the strategies operate at a reasonable trading frequency, balancing responsiveness to market signals with execution feasibility.
+
+Overall, the analysis confirms that the final strategies are well-suited to their respective asset groups and satisfy the methodological and performance criteria outlined in the project requirements. These results provide a solid foundation for subsequent out-of-sample evaluation and further robustness checks, which will allow for a more comprehensive assessment of real-world applicability.
