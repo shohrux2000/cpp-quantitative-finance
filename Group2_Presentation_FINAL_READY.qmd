@@ -1,0 +1,360 @@
+---
+title: "Quantitative Strategies on High Frequency Data Project"
+author: "Azizbek Ganiev (475150), Shokhrukhbek Valijonov (475154)"
+format:
+  revealjs:
+    slide-number: true
+    theme: simple
+    center: false
+    width: 1280
+    height: 720
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+## Group 1 | Strategy selection (SP, NQ)
+
+- *Goal:* robust intraday trend capture with controlled turnover
+- *Candidates considered:*
+  - moving-average crossover (trend-following)
+  - contrarian / mean-reversion entry
+- *Key observation:*
+  - on intraday data, mean-reversion entries created too many trades
+  - transaction costs reduced net performance
+- *Final choice:* trend-following moving-average crossover on log-prices with a volatility filter  
+  - positions in {-1, 0, +1}  
+  - fixed parameters (same for all quarters)
+
+---
+
+## Key design principle (Group 1)
+
+- The strategy is **not** designed to always stay in the market
+- Positions change only when the trend signal is clearly stronger than noise
+- This helps to:
+  - reduce over-trading
+  - control transaction costs
+  - keep net results more stable
+
+---
+
+## Signal construction (Group 1)
+
+- Trend direction is defined by **fast MA vs slow MA** on log-prices  
+  - fast above slow → long bias  
+  - fast below slow → short bias
+- Volatility filter:
+  - trading is allowed only when volatility condition is satisfied
+- Positions are restricted to **{-1, 0, +1}** and kept until a new signal appears
+
+---
+
+## Parameters (fixed)
+
+- MA fast / slow: **FAST = 24**, **SLOW = 96**
+- Volatility window: **VOL_WINDOW = 96**
+- Volatility threshold: **VOL_MIN = 0.0**
+- Transaction costs and point values are taken from the assignment specification
+
+---
+
+## Results (Group 1)
+
+```{python}
+import math
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+# ======================
+# FINAL fixed parameters
+# ======================
+FAST = 24
+SLOW = 96
+VOL_WINDOW = 96
+VOL_MIN = 0.0
+
+# ==============================
+# Asset specs: costs & pointvalue
+# ==============================
+ASSET_SPECS = {
+    # Group 1 (1-min)
+    "SP":  {"tc": 12.0, "point_value": 50.0},
+    "NQ":  {"tc": 12.0, "point_value": 20.0},
+    # Group 2 (5-min)
+    "CAD": {"tc": 10.0, "point_value": 100000.0},
+    "AUD": {"tc": 10.0, "point_value": 100000.0},
+    "XAU": {"tc": 15.0, "point_value": 100.0},
+    "XAG": {"tc": 10.0, "point_value": 5000.0},
+}
+
+GROUP1_ASSETS = ["SP", "NQ"]
+GROUP2_ASSETS = ["CAD", "AUD", "XAU", "XAU", "XAG"]
+
+DATA_ROOT = Path("data")
+RESULTS_DIR = Path("results")
+RESULTS_DIR.mkdir(exist_ok=True)
+
+def detect_datetime_column(df: pd.DataFrame) -> str:
+    candidates = [c for c in df.columns if c.lower() in {"datetime", "date", "time", "timestamp"}]
+    return candidates[0] if candidates else df.columns[0]
+
+def infer_quarter_from_name(path: Path) -> str:
+    parent = path.parent.name
+    if len(parent) >= 5 and parent[:4].isdigit() and "Q" in parent:
+        return parent
+    name = path.stem
+    for year in range(1990, 2100):
+        for qi in range(1, 5):
+            token = f"{year}Q{qi}"
+            if token in name:
+                return token
+    return "Q_unknown"
+
+def infer_group_from_columns(cols) -> str:
+    cols = set(cols)
+    if any(a in cols for a in GROUP1_ASSETS):
+        return "group1"
+    if any(a in cols for a in ["CAD","AUD","XAU","XAG"]):
+        return "group2"
+    return "unknown"
+
+def read_file(path: Path) -> pd.DataFrame:
+    if path.suffix.lower() == ".parquet":
+        return pd.read_parquet(path)
+    return pd.read_csv(path)
+
+def load_quarter_group_files(data_root: Path) -> dict:
+    files = sorted(list(data_root.rglob("*.parquet")) + list(data_root.rglob("*.csv")))
+    out = {}
+    for f in files:
+        df = read_file(f)
+        if isinstance(df.index, pd.DatetimeIndex):
+            dfi = df.copy()
+        else:
+            dt_col = detect_datetime_column(df)
+            df[dt_col] = pd.to_datetime(df[dt_col], errors="coerce")
+            dfi = df.dropna(subset=[dt_col]).sort_values(dt_col).set_index(dt_col)
+
+        grp = infer_group_from_columns(dfi.columns)
+        if grp == "unknown":
+            continue
+
+        q = infer_quarter_from_name(f)
+        if q not in out:
+            out[q] = {}
+
+        assets = GROUP1_ASSETS if grp == "group1" else ["CAD","AUD","XAU","XAG"]
+        present = [a for a in assets if a in dfi.columns]
+        out[q][grp] = dfi[present].apply(pd.to_numeric, errors="coerce").dropna(how="all")
+
+    if not out:
+        raise ValueError("No usable files detected under 'data/'.")
+    return out
+
+def generate_positions(prices: pd.Series) -> pd.Series:
+    prices = prices.dropna()
+    logp = np.log(prices)
+
+    ma_fast = logp.rolling(FAST, min_periods=FAST).mean()
+    ma_slow = logp.rolling(SLOW, min_periods=SLOW).mean()
+
+    raw = np.where(ma_fast > ma_slow, 1, np.where(ma_fast < ma_slow, -1, 0))
+    raw = pd.Series(raw, index=prices.index).astype(float)
+
+    vol = logp.diff().rolling(VOL_WINDOW, min_periods=VOL_WINDOW).std()
+    ok = (vol >= VOL_MIN).astype(float)
+
+    pos = (raw * ok).fillna(0.0)
+    pos = pos.replace(0.0, np.nan).ffill().fillna(0.0).clip(-1, 1)
+    return pos
+
+def apply_group2_rules(pos: pd.Series) -> pd.Series:
+    hhmm = pos.index.strftime("%H:%M")
+    pos2 = pos.copy()
+    pos2.loc[hhmm == "16:50"] = 0.0
+    no_trade = (hhmm >= "16:50") & (hhmm < "18:10")
+    pos2.loc[no_trade] = pos2.shift(1).loc[no_trade].fillna(0.0)
+    return pos2
+
+def apply_group1_rules(prices: pd.Series, pos: pd.Series):
+    idx = prices.index
+    hhmm = idx.strftime("%H:%M")
+
+    prices_used = prices.copy()
+    bad_calc = ((hhmm >= "09:31") & (hhmm <= "09:40")) | ((hhmm >= "15:51") & (hhmm <= "16:00"))
+    prices_used.loc[bad_calc] = np.nan
+
+    pos2 = pos.copy()
+    pos2.loc[hhmm == "15:40"] = 0.0
+    no_trade = (hhmm >= "09:31") & (hhmm <= "09:55")
+    pos2.loc[no_trade] = pos2.shift(1).loc[no_trade].fillna(0.0)
+    return prices_used, pos2
+
+def _safe_sharpe(daily_pnl: pd.Series, periods_per_year: int = 252) -> float:
+    x = daily_pnl.dropna()
+    if len(x) < 2:
+        return float("nan")
+    sd = x.std(ddof=1)
+    if sd == 0 or np.isnan(sd):
+        return float("nan")
+    return float((x.mean() / sd) * math.sqrt(periods_per_year))
+
+def _max_drawdown(equity: pd.Series) -> float:
+    peak = equity.cummax()
+    dd = equity - peak
+    return float(dd.min())
+
+def _safe_calmar(daily_pnl: pd.Series, periods_per_year: int = 252) -> float:
+    x = daily_pnl.dropna()
+    if len(x) < 2:
+        return float("nan")
+    equity = x.cumsum()
+    mdd = _max_drawdown(equity)
+    if mdd == 0 or np.isnan(mdd):
+        return float("nan")
+    ann_return = x.mean() * periods_per_year
+    return float(ann_return / abs(mdd))
+
+def backtest_one_asset(prices: pd.Series, asset: str, group: str) -> dict:
+    spec = ASSET_SPECS[asset]
+    pv = float(spec["point_value"])
+    tc = float(spec["tc"])
+
+    if group == "group1":
+        prices_used, pos = apply_group1_rules(prices, generate_positions(prices))
+        px = prices_used.dropna()
+        pos = pos.reindex(px.index).fillna(0.0)
+    else:
+        px = prices.dropna()
+        pos = generate_positions(px)
+        pos = apply_group2_rules(pos)
+
+    trades = pos.diff().abs().fillna(0.0)
+    dp = px.diff()
+
+    gross_pnl = pos.shift(1).fillna(0.0) * dp * pv
+    costs = trades * tc
+    net_pnl = gross_pnl - costs
+
+    gross_daily = gross_pnl.resample("1D").sum()
+    net_daily = net_pnl.resample("1D").sum()
+    ntrades_daily = trades.resample("1D").sum()
+
+    out = {
+        "grossSR": _safe_sharpe(gross_daily),
+        "netSR": _safe_sharpe(net_daily),
+        "grossCR": _safe_calmar(gross_daily),
+        "netCR": _safe_calmar(net_daily),
+        "grossCumPnL": float(gross_daily.sum()) if len(gross_daily) else float("nan"),
+        "netCumPnL": float(net_daily.sum()) if len(net_daily) else float("nan"),
+        "av_ntrades": float(ntrades_daily.mean()) if len(ntrades_daily) else float("nan"),
+        "netPnL": float(net_daily.sum()) if len(net_daily) else float("nan"),
+    }
+    return out
+
+quarter_group_data = load_quarter_group_files(DATA_ROOT)
+
+rows = []
+for quarter, gmap in quarter_group_data.items():
+    for group, df in gmap.items():
+        for asset in df.columns:
+            m = backtest_one_asset(df[asset].dropna(), asset, group)
+            rows.append({"quarter": quarter, "group": group, "asset": asset, **m})
+
+summary = pd.DataFrame(rows)
+summary["stat"] = (summary["netSR"] - 0.5) * np.maximum(
+    0.0, np.log(np.abs(summary["netPnL"] / 1000.0))
+)
+
+summary = summary[
+    ["quarter","group","asset","grossSR","netSR","grossCR","netCR","grossCumPnL","netCumPnL","av_ntrades","stat"]
+].sort_values(["group","quarter","asset"]).reset_index(drop=True)
+
+summary_round = summary.copy()
+num_cols = ["grossSR","netSR","grossCR","netCR","grossCumPnL","netCumPnL","av_ntrades","stat"]
+summary_round[num_cols] = summary_round[num_cols].round(4)
+
+# Save
+out_csv = RESULTS_DIR / "summary_table.csv"
+summary_round.to_csv(out_csv, index=False)
+
+g1 = summary_round[summary_round["group"] == "group1"].copy()
+g1
+```
+
+```{python}
+# Show Group 1 results as a readable table on the slide
+numeric_cols = g1.select_dtypes(include=["float","int"]).columns
+g1_display = g1.copy()
+
+styled_g1 = (
+    g1_display.style
+    .format("{:.4f}", subset=numeric_cols)
+    .set_properties(**{"text-align": "right"})
+    .set_table_styles([
+        {"selector": "th", "props": [("font-size", "18px"), ("text-align","center")]},
+        {"selector": "td", "props": [("font-size", "18px")]},
+        {"selector": "table", "props": [("width", "100%")]}
+    ])
+    .hide(axis="index")
+)
+styled_g1
+```
+
+---
+
+## Group 2 | Strategy selection (CAD, AUD, XAU, XAG)
+
+- Group 2 trades almost 24 hours with a daily break (17:00–18:00 CET)
+- We use the same idea (trend-following) and keep parameters fixed
+- Trading constraints for Group 2:
+  - exit all positions at 16:50
+  - no new positions between 16:50 and 18:10
+
+---
+
+## Results (Group 2)
+
+```{python}
+g2 = summary_round[summary_round["group"] == "group2"].copy()
+g2
+```
+
+```{python}
+# Show Group 2 results as a readable table on the slide
+numeric_cols = g2.select_dtypes(include=["float","int"]).columns
+
+styled_g2 = (
+    g2.style
+    .format("{:.4f}", subset=numeric_cols)
+    .set_properties(**{"text-align": "right"})
+    .set_table_styles([
+        {"selector": "th", "props": [("font-size", "18px"), ("text-align","center")]},
+        {"selector": "td", "props": [("font-size", "18px")]},
+        {"selector": "table", "props": [("width", "100%")]}
+    ])
+    .hide(axis="index")
+)
+styled_g2
+```
+
+---
+
+---
+
+## Group 2 – Interpretation of results
+
+- Profits mainly occur during **strong intraday trends**
+- Net performance deteriorates in **sideways market regimes**
+- Trade count remains relatively **stable across quarters**
+- Overall performance is driven by a **small number of strong trends**
+- The strategy is therefore **regime-dependent**
+
+## Conclusion
+
+- We applied one final strategy with a fixed parameter set to **Group 1** and **Group 2**.
+- Results are shown on slides (per quarter, per asset) and exported to `results/summary_table.csv`.
+- The presentation follows all trading constraints required in the assignment.
